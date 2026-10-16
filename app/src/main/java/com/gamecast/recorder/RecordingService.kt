@@ -1,3 +1,4 @@
+
 package com.gamecast.recorder
 
 import android.app.Notification
@@ -18,8 +19,8 @@ import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
-import android.media.MediaRecorder
 import android.media.MediaMuxer
+import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
@@ -28,13 +29,12 @@ import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.DisplayMetrics
 import android.view.WindowManager
+import android.view.Surface
 import androidx.core.app.NotificationCompat
 import java.io.File
-import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -63,50 +63,42 @@ class RecordingService : Service() {
 
         private const val CHANNEL_ID = "gamecast_recording"
         private const val NOTIFICATION_ID = 4101
-        private const val DEFAULT_LONG_EDGE = 1920
-        private const val AUDIO_SAMPLE_RATE = 44100
-        private const val AUDIO_CHANNEL_MASK = AudioFormat.CHANNEL_IN_STEREO
-        private const val AUDIO_ENCODING = AudioFormat.ENCODING_PCM_16BIT
-        private const val AUDIO_BIT_RATE = 128_000
+        private const val FPS = 30
+        private const val AUDIO_RATE = 44100
+        private const val AUDIO_BITRATE = 128000
     }
 
     private var projection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var recorder: MediaRecorder? = null
-
-    private var audioRecord: AudioRecord? = null
+    private var display: VirtualDisplay? = null
+    private var videoCodec: MediaCodec? = null
     private var audioCodec: MediaCodec? = null
+    private var audioRecord: AudioRecord? = null
+    private var videoSurface: Surface? = null
     private var muxer: MediaMuxer? = null
-
     private var outputUri: Uri? = null
     private var outputFile: File? = null
-    private var outputDescriptor: ParcelFileDescriptor? = null
 
-    private var recordingStarted = false
-    private var paused = false
-    private var internalAudioEnabled = false
-    private var micEnabled = false
-
-    private var audioThread: Thread? = null
     private var videoTrack = -1
     private var audioTrack = -1
     private var muxerStarted = false
-    private var audioPtsUs = 0L
-    private var audioFailure: String? = null
+    private var recording = false
+    private var paused = false
+    private var micEnabled = false
+    private var internalAudio = false
+    private var width = 0
+    private var height = 0
+    private var videoPts = 0L
+    private var audioPts = 0L
+    private var videoThread: Thread? = null
+    private var audioThread: Thread? = null
 
+    private val running = AtomicBoolean(false)
     private val audioRunning = AtomicBoolean(false)
-    private val audioPaused = AtomicBoolean(false)
-    private val muxerLock = Any()
+    private val muxLock = Any()
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
-            if (recordingStarted) {
-                stopRecording(
-                    save = true,
-                    message = "Screen capture ended",
-                    stopProjection = false
-                )
-            }
+            if (recording) stopRecording(true, "Screen capture ended")
         }
     }
 
@@ -114,7 +106,13 @@ class RecordingService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "GameCast Recording",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        getSystemService(NotificationManager::class.java)
+            .createNotificationChannel(channel)
     }
 
     override fun onStartCommand(
@@ -124,108 +122,44 @@ class RecordingService : Service() {
     ): Int {
         when (intent?.action) {
             ACTION_START -> {
-                if (recorder != null || projection != null) {
-                    return START_NOT_STICKY
-                }
-
+                if (recording || projection != null) return START_NOT_STICKY
                 try {
-                    startAsForeground()
-
+                    startForegroundCompat()
                     val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
-
-                    val resultData: Intent? =
+                    val data: Intent? =
                         if (Build.VERSION.SDK_INT >= 33) {
                             intent.getParcelableExtra(
-                                EXTRA_PROJECTION_DATA,
-                                Intent::class.java
+                                EXTRA_PROJECTION_DATA, Intent::class.java
                             )
                         } else {
                             @Suppress("DEPRECATION")
                             intent.getParcelableExtra(EXTRA_PROJECTION_DATA)
                         }
 
-                    if (resultData == null) {
-                        throw IllegalStateException(
-                            "Screen capture permission data is missing."
-                        )
-                    }
+                    requireNotNull(data) { "Screen capture permission is missing." }
 
-                    micEnabled = intent.getBooleanExtra(
-                        EXTRA_MIC_ENABLED,
-                        false
+                    micEnabled = intent.getBooleanExtra(EXTRA_MIC_ENABLED, false)
+                    val requested = intent.getIntExtra(
+                        EXTRA_QUALITY_LONG_EDGE, 1920
                     )
+                    val label = intent.getStringExtra(EXTRA_QUALITY_LABEL) ?: "1080p"
 
-                    startRecording(
-                        resultCode = resultCode,
-                        resultData = resultData,
-                        micEnabled = micEnabled,
-                        requestedLongEdge = intent.getIntExtra(
-                            EXTRA_QUALITY_LONG_EDGE,
-                            DEFAULT_LONG_EDGE
-                        ),
-                        qualityLabel = intent.getStringExtra(
-                            EXTRA_QUALITY_LABEL
-                        ) ?: "1080p"
-                    )
+                    startRecording(resultCode, data, requested, label)
                 } catch (e: Exception) {
-                    stopRecording(
-                        save = false,
-                        message = "Could not start recording: " +
-                            (e.message ?: "Unknown error")
-                    )
+                    stopRecording(false, "Could not start: ${e.message}")
                 }
             }
 
-            ACTION_STOP -> stopRecording(save = true)
-
-            ACTION_PAUSE -> {
-                try {
-                    if (recordingStarted && !paused) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                            recorder?.pause()
-                        }
-                        paused = true
-                        audioPaused.set(true)
-                        sendStatus(true, true, "Recording paused")
-                        updateNotification("Recording paused")
-                    }
-                } catch (e: Exception) {
-                    sendStatus(
-                        recordingStarted,
-                        paused,
-                        "Pause failed: ${e.message ?: "Unknown error"}"
-                    )
-                }
-            }
-
-            ACTION_RESUME -> {
-                try {
-                    if (recordingStarted && paused) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                            recorder?.resume()
-                        }
-                        paused = false
-                        audioPaused.set(false)
-                        sendStatus(true, false, "Recording resumed")
-                        updateNotification("Recording in progress")
-                    }
-                } catch (e: Exception) {
-                    sendStatus(
-                        recordingStarted,
-                        paused,
-                        "Resume failed: ${e.message ?: "Unknown error"}"
-                    )
-                }
-            }
+            ACTION_STOP -> stopRecording(true, "Recording saved")
+            ACTION_PAUSE -> pauseRecording()
+            ACTION_RESUME -> resumeRecording()
         }
-
         return START_NOT_STICKY
     }
 
-    private fun startAsForeground() {
-        val notification = createNotification("Preparing recording")
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+    private fun startForegroundCompat() {
+        val notification = notification("Preparing recording")
+        if (Build.VERSION.SDK_INT >= 29) {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
@@ -238,549 +172,439 @@ class RecordingService : Service() {
 
     private fun startRecording(
         resultCode: Int,
-        resultData: Intent,
-        micEnabled: Boolean,
+        data: Intent,
         requestedLongEdge: Int,
         qualityLabel: String
     ) {
-        val manager = getSystemService(
-            Context.MEDIA_PROJECTION_SERVICE
-        ) as MediaProjectionManager
+        val manager = getSystemService(MEDIA_PROJECTION_SERVICE)
+                as MediaProjectionManager
+        projection = manager.getMediaProjection(resultCode, data)
+            ?: error("Screen capture permission was rejected.")
 
-        projection = manager.getMediaProjection(resultCode, resultData)
-            ?: throw IllegalStateException(
-                "Android did not provide screen capture."
-            )
+        projection!!.registerCallback(projectionCallback, Handler(Looper.getMainLooper()))
 
-        projection?.registerCallback(
-            projectionCallback,
-            Handler(Looper.getMainLooper())
-        )
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        (getSystemService(WINDOW_SERVICE) as WindowManager)
+            .defaultDisplay.getRealMetrics(metrics)
 
-        val metrics = getScreenMetrics()
-        val sourceWidth = metrics.widthPixels
-        val sourceHeight = metrics.heightPixels
-        val density = metrics.densityDpi
+        val sourceW = metrics.widthPixels
+        val sourceH = metrics.heightPixels
+        require(sourceW > 0 && sourceH > 0) { "Invalid screen dimensions." }
 
-        if (sourceWidth <= 0 || sourceHeight <= 0) {
-            throw IllegalStateException("Invalid screen dimensions.")
-        }
-
-        val sourceLongEdge = max(sourceWidth, sourceHeight).toFloat()
-        val requestedEdge = requestedLongEdge.coerceIn(854, 2560)
-        val scale = min(1f, requestedEdge / sourceLongEdge)
-
-        val width = evenDimension(sourceWidth * scale)
-        val height = evenDimension(sourceHeight * scale)
-
-        if (width <= 0 || height <= 0) {
-            throw IllegalStateException("Invalid output dimensions.")
-        }
+        val scale = min(1f, requestedLongEdge.coerceIn(854, 2560) /
+                max(sourceW, sourceH).toFloat())
+        width = even(sourceW * scale)
+        height = even(sourceH * scale)
 
         val name = "GameCast_" +
-            SimpleDateFormat(
-                "yyyyMMdd_HHmmss",
-                Locale.US
-            ).format(Date()) + ".mp4"
+                SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) +
+                ".mp4"
 
-        val mediaRecorder =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                MediaRecorder(this)
-            } else {
-                @Suppress("DEPRECATION")
-                MediaRecorder()
-            }
+        createOutput(name)
 
-        recorder = mediaRecorder
-        mediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+        internalAudio = !micEnabled && Build.VERSION.SDK_INT >= 29
 
         if (micEnabled) {
-            mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+            startMicRecorder(name, qualityLongEdgeBitrate(qualityLabel))
+        } else {
+            startEncodedRecording(
+                qualityLongEdgeBitrate(qualityLabel),
+                captureInternalAudio = internalAudio
+            )
         }
 
-        mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-        mediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-
-        if (micEnabled) {
-            mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            mediaRecorder.setAudioEncodingBitRate(AUDIO_BIT_RATE)
-            mediaRecorder.setAudioSamplingRate(AUDIO_SAMPLE_RATE)
-        }
-
-        mediaRecorder.setVideoSize(width, height)
-        mediaRecorder.setVideoFrameRate(30)
-
-        val videoBitRate = when (qualityLabel) {
-            "480p" -> 2_000_000
-            "540p" -> 3_000_000
-            "720p" -> 5_000_000
-            "1080p" -> 8_000_000
-            "2K" -> 12_000_000
-            else -> 8_000_000
-        }
-
-        mediaRecorder.setVideoEncodingBitRate(videoBitRate)
-        configureOutput(name, mediaRecorder)
-        mediaRecorder.prepare()
-
-        virtualDisplay = projection?.createVirtualDisplay(
-            "GameCastScreenCapture",
-            width,
-            height,
-            density,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            mediaRecorder.surface,
-            null,
-            null
-        ) ?: throw IllegalStateException(
-            "Could not create the screen display."
-        )
-
-        mediaRecorder.start()
-        recordingStarted = true
+        recording = true
         paused = false
-
-        /*
-         * Internal audio is started only when microphone audio is off.
-         * MediaRecorder and a separate MediaMuxer cannot safely write
-         * their tracks into the same MP4 at the same time.
-         */
-        if (!micEnabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
-                startInternalAudioCapture()
-                internalAudioEnabled = true
-            } catch (e: Exception) {
-                internalAudioEnabled = false
-                audioFailure = e.message ?: "Internal audio is unavailable"
-            }
-        }
-
-        val audioDescription = when {
-            micEnabled -> "with microphone audio"
-            internalAudioEnabled -> "with internal game audio"
-            else -> "without audio" +
-                (audioFailure?.let { " ($it)" } ?: "")
-        }
-
         sendStatus(
-            true,
-            false,
-            "Recording $qualityLabel ($width × $height), $audioDescription"
+            true, false,
+            "Recording $qualityLabel ($width × $height)" +
+                    when {
+                        micEnabled -> " with microphone"
+                        internalAudio -> " with internal audio"
+                        else -> " without audio (internal capture requires Android 10+)"
+                    }
         )
         updateNotification("Recording in progress • $qualityLabel")
     }
 
-    private fun startInternalAudioCapture() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            throw IllegalStateException(
-                "Internal audio requires Android 10 or newer."
-            )
+    /*
+     * Microphone mode uses MediaRecorder for compatibility.
+     * Internal audio mode uses MediaCodec + MediaMuxer; the two modes
+     * deliberately do not write to the same MP4 concurrently.
+     */
+    private fun startMicRecorder(name: String, bitrate: Int) {
+        val recorder = if (Build.VERSION.SDK_INT >= 31) {
+            MediaRecorder(this)
+        } else {
+            @Suppress("DEPRECATION")
+            MediaRecorder()
         }
 
-        val currentProjection = projection
-            ?: throw IllegalStateException("Screen projection is unavailable.")
+        recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+        recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+        recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+        recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+        recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+        recorder.setAudioEncodingBitRate(AUDIO_BITRATE)
+        recorder.setAudioSamplingRate(AUDIO_RATE)
+        recorder.setVideoSize(width, height)
+        recorder.setVideoFrameRate(FPS)
+        recorder.setVideoEncodingBitRate(bitrate)
 
-        val captureConfig =
-            AudioPlaybackCaptureConfiguration.Builder(currentProjection)
-                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                .build()
+        if (Build.VERSION.SDK_INT >= 29) {
+            val uri = outputUri ?: error("Output file is unavailable.")
+            val pfd = contentResolver.openFileDescriptor(uri, "w")
+                ?: error("Could not open output file.")
+            try {
+                recorder.setOutputFile(pfd.fileDescriptor)
+                recorder.prepare()
+                display = projection!!.createVirtualDisplay(
+                    "GameCastScreenCapture", width, height, getDensity(),
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    recorder.surface, null, null
+                ) ?: error("Could not create screen display.")
+                recorder.start()
+            } finally {
+                pfd.close()
+            }
+        } else {
+            val file = outputFile ?: error("Output file is unavailable.")
+            recorder.setOutputFile(file.absolutePath)
+            recorder.prepare()
+            display = projection!!.createVirtualDisplay(
+                "GameCastScreenCapture", width, height, getDensity(),
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                recorder.surface, null, null
+            ) ?: error("Could not create screen display.")
+            recorder.start()
+        }
 
-        val format = AudioFormat.Builder()
-            .setEncoding(AUDIO_ENCODING)
-            .setSampleRate(AUDIO_SAMPLE_RATE)
-            .setChannelMask(AUDIO_CHANNEL_MASK)
+        // Keep the recorder reference for pause/resume/stop.
+        micRecorder = recorder
+    }
+
+    private var micRecorder: MediaRecorder? = null
+
+    private fun startEncodedRecording(
+        bitrate: Int,
+        captureInternalAudio: Boolean
+    ) {
+        val format = MediaFormat.createVideoFormat(
+            MediaFormat.MIMETYPE_VIDEO_AVC, width, height
+        ).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+        }
+
+        val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        videoSurface = encoder.createInputSurface()
+        encoder.start()
+        videoCodec = encoder
+
+        display = projection!!.createVirtualDisplay(
+            "GameCastScreenCapture", width, height, getDensity(),
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            videoSurface, null, null
+        ) ?: error("Could not create screen display.")
+
+        if (captureInternalAudio) startAudioEncoder()
+
+        running.set(true)
+        videoThread = Thread({ drainVideoEncoder() }, "GameCastVideoEncoder")
+            .apply { isDaemon = true; start() }
+    }
+
+    private fun startAudioEncoder() {
+        check(Build.VERSION.SDK_INT >= 29) {
+            "Internal audio requires Android 10 or newer."
+        }
+
+        val capture = AudioPlaybackCaptureConfiguration.Builder(projection!!)
+            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+            .addMatchingUsage(AudioAttributes.USAGE_GAME)
             .build()
 
-        val minBuffer = AudioRecord.getMinBufferSize(
-            AUDIO_SAMPLE_RATE,
-            AUDIO_CHANNEL_MASK,
-            AUDIO_ENCODING
+        val pcmFormat = AudioFormat.Builder()
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .setSampleRate(AUDIO_RATE)
+            .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+            .build()
+
+        val bufferSize = max(
+            AudioRecord.getMinBufferSize(
+                AUDIO_RATE,
+                AudioFormat.CHANNEL_IN_STEREO,
+                AudioFormat.ENCODING_PCM_16BIT
+            ), 16384
         )
 
-        if (minBuffer <= 0) {
-            throw IllegalStateException("Could not initialize audio buffer.")
-        }
-
-        val bufferSize = max(minBuffer * 2, 16_384)
-
         val record = AudioRecord.Builder()
-            .setAudioFormat(format)
+            .setAudioFormat(pcmFormat)
             .setBufferSizeInBytes(bufferSize)
-            .setAudioPlaybackCaptureConfig(captureConfig)
+            .setAudioPlaybackCaptureConfig(capture)
             .build()
 
-        if (record.state != AudioRecord.STATE_INITIALIZED) {
-            record.release()
-            throw IllegalStateException(
-                "Internal audio capture could not be initialized."
-            )
+        check(record.state == AudioRecord.STATE_INITIALIZED) {
+            "Internal audio capture could not be initialized."
         }
 
-        val audioFormat = MediaFormat.createAudioFormat(
-            MediaFormat.MIMETYPE_AUDIO_AAC,
-            AUDIO_SAMPLE_RATE,
-            2
+        val format = MediaFormat.createAudioFormat(
+            MediaFormat.MIMETYPE_AUDIO_AAC, AUDIO_RATE, 2
         ).apply {
-            setInteger(
-                MediaFormat.KEY_AAC_PROFILE,
-                MediaCodecInfo.CodecProfileLevel.AACObjectLC
-            )
-            setInteger(MediaFormat.KEY_BIT_RATE, AUDIO_BIT_RATE)
+            setInteger(MediaFormat.KEY_AAC_PROFILE,
+                MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            setInteger(MediaFormat.KEY_BIT_RATE, AUDIO_BITRATE)
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, bufferSize)
         }
 
-        val codec = MediaCodec.createEncoderByType(
-            MediaFormat.MIMETYPE_AUDIO_AAC
-        )
-
-        codec.configure(
-            audioFormat,
-            null,
-            null,
-            MediaCodec.CONFIGURE_FLAG_ENCODE
-        )
-
-        audioRecord = record
-        audioCodec = codec
-        audioRunning.set(true)
-        audioPaused.set(false)
-        audioPtsUs = 0L
-
-        codec.start()
+        val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+        encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        encoder.start()
         record.startRecording()
 
-        audioThread = Thread({
-            try {
-                pumpInternalAudio(record, codec)
-            } catch (e: Exception) {
-                audioFailure = e.message ?: "Internal audio capture failed"
-            }
-        }, "GameCastInternalAudio").apply {
-            isDaemon = true
-            start()
-        }
+        audioRecord = record
+        audioCodec = encoder
+        audioRunning.set(true)
+
+        audioThread = Thread({ pumpAudioEncoder() }, "GameCastAudioEncoder")
+            .apply { isDaemon = true; start() }
     }
 
-    private fun pumpInternalAudio(
-        record: AudioRecord,
-        codec: MediaCodec
-    ) {
+    private fun drainVideoEncoder() {
+        val codec = videoCodec ?: return
         val info = MediaCodec.BufferInfo()
-        val pcmBuffer = ByteArray(8192)
 
-        while (audioRunning.get()) {
-            if (audioPaused.get()) {
-                Thread.sleep(20)
-                continue
-            }
-
-            val inputIndex = codec.dequeueInputBuffer(10_000)
-
-            if (inputIndex >= 0) {
-                val inputBuffer = codec.getInputBuffer(inputIndex)
-
-                if (inputBuffer != null) {
-                    inputBuffer.clear()
-
-                    val capacity = min(inputBuffer.remaining(), pcmBuffer.size)
-                    val read = record.read(
-                        pcmBuffer,
-                        0,
-                        capacity,
-                        AudioRecord.READ_BLOCKING
-                    )
-
-                    if (read > 0) {
-                        inputBuffer.put(pcmBuffer, 0, read)
-
-                        val frameCount = read / 4
-                        val pts = audioPtsUs
-                        audioPtsUs +=
-                            frameCount * 1_000_000L / AUDIO_SAMPLE_RATE
-
-                        codec.queueInputBuffer(
-                            inputIndex,
-                            0,
-                            read,
-                            pts,
-                            0
-                        )
-                    } else {
-                        codec.queueInputBuffer(
-                            inputIndex,
-                            0,
-                            0,
-                            audioPtsUs,
-                            0
-                        )
-                    }
-                }
-            }
-
-            drainAudioEncoder(codec, info, false)
-        }
-
-        val endIndex = codec.dequeueInputBuffer(10_000)
-        if (endIndex >= 0) {
-            codec.queueInputBuffer(
-                endIndex,
-                0,
-                0,
-                audioPtsUs,
-                MediaCodec.BUFFER_FLAG_END_OF_STREAM
-            )
-        }
-
-        drainAudioEncoder(codec, info, true)
-    }
-
-    private fun drainAudioEncoder(
-        codec: MediaCodec,
-        info: MediaCodec.BufferInfo,
-        endOfStream: Boolean
-    ) {
-        var attempts = 0
-
-        while (attempts < if (endOfStream) 20 else 1) {
-            val outputIndex = codec.dequeueOutputBuffer(info, 10_000)
-
-            when {
-                outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                    if (!endOfStream) return
-                    attempts++
+        try {
+            while (running.get()) {
+                if (paused) {
+                    Thread.sleep(20)
+                    continue
                 }
 
-                outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    synchronized(muxerLock) {
-                        val currentMuxer = muxer
-                            ?: throw IllegalStateException(
-                                "Audio muxer is unavailable."
-                            )
-
-                        if (audioTrack < 0) {
-                            audioTrack = currentMuxer.addTrack(
-                                codec.outputFormat
-                            )
-                        }
-
+                when (val index = codec.dequeueOutputBuffer(info, 10000)) {
+                    MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> synchronized(muxLock) {
+                        videoTrack = muxer!!.addTrack(codec.outputFormat)
                         startMuxerIfReady()
                     }
-                }
-
-                outputIndex >= 0 -> {
-                    val outputBuffer = codec.getOutputBuffer(outputIndex)
-
-                    if (outputBuffer != null &&
-                        info.size > 0 &&
-                        (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
-                    ) {
-                        synchronized(muxerLock) {
-                            if (muxerStarted && audioTrack >= 0) {
-                                outputBuffer.position(info.offset)
-                                outputBuffer.limit(info.offset + info.size)
-                                muxer?.writeSampleData(
-                                    audioTrack,
-                                    outputBuffer,
-                                    info
-                                )
+                    else -> if (index >= 0) {
+                        val buffer = codec.getOutputBuffer(index)
+                        if (buffer != null && info.size > 0 &&
+                            info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0
+                        ) {
+                            synchronized(muxLock) {
+                                if (muxerStarted && videoTrack >= 0) {
+                                    buffer.position(info.offset)
+                                    buffer.limit(info.offset + info.size)
+                                    muxer!!.writeSampleData(videoTrack, buffer, info)
+                                }
                             }
                         }
+                        codec.releaseOutputBuffer(index, false)
                     }
-
-                    val isEnd =
-                        (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-
-                    codec.releaseOutputBuffer(outputIndex, false)
-
-                    if (isEnd) return
                 }
+            }
+        } catch (e: Exception) {
+            if (recording) sendStatus(true, paused, "Video encoder: ${e.message}")
+        }
+    }
+
+    private fun pumpAudioEncoder() {
+        val record = audioRecord ?: return
+        val codec = audioCodec ?: return
+        val info = MediaCodec.BufferInfo()
+        val pcm = ByteArray(8192)
+
+        try {
+            while (audioRunning.get()) {
+                if (paused) {
+                    Thread.sleep(20)
+                    continue
+                }
+
+                val inputIndex = codec.dequeueInputBuffer(10000)
+                if (inputIndex >= 0) {
+                    val input = codec.getInputBuffer(inputIndex)
+                    if (input != null) {
+                        input.clear()
+                        val count = record.read(
+                            pcm, 0, min(pcm.size, input.remaining()),
+                            AudioRecord.READ_BLOCKING
+                        )
+                        if (count > 0) {
+                            input.put(pcm, 0, count)
+                            val frames = count / 4
+                            val pts = audioPts
+                            audioPts += frames * 1_000_000L / AUDIO_RATE
+                            codec.queueInputBuffer(inputIndex, 0, count, pts, 0)
+                        } else {
+                            codec.queueInputBuffer(inputIndex, 0, 0, audioPts, 0)
+                        }
+                    }
+                }
+
+                drainAudioOutput(codec, info)
+            }
+        } catch (e: Exception) {
+            if (recording) sendStatus(true, paused, "Audio capture: ${e.message}")
+        }
+    }
+
+    private fun drainAudioOutput(codec: MediaCodec, info: MediaCodec.BufferInfo) {
+        when (val index = codec.dequeueOutputBuffer(info, 10000)) {
+            MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+            MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> synchronized(muxLock) {
+                audioTrack = muxer!!.addTrack(codec.outputFormat)
+                startMuxerIfReady()
+            }
+            else -> if (index >= 0) {
+                val buffer = codec.getOutputBuffer(index)
+                if (buffer != null && info.size > 0 &&
+                    info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0
+                ) {
+                    synchronized(muxLock) {
+                        if (muxerStarted && audioTrack >= 0) {
+                            buffer.position(info.offset)
+                            buffer.limit(info.offset + info.size)
+                            muxer!!.writeSampleData(audioTrack, buffer, info)
+                        }
+                    }
+                }
+                codec.releaseOutputBuffer(index, false)
             }
         }
     }
 
     private fun startMuxerIfReady() {
-        if (!muxerStarted && audioTrack >= 0 && videoTrack >= 0) {
-            muxer?.start()
+        if (!muxerStarted && videoTrack >= 0 &&
+            (!internalAudio || audioTrack >= 0)
+        ) {
+            muxer!!.start()
             muxerStarted = true
         }
     }
 
-    private fun stopInternalAudioCapture() {
-        audioRunning.set(false)
-
+    private fun pauseRecording() {
+        if (!recording || paused) return
         try {
-            audioRecord?.stop()
-        } catch (_: Exception) {
+            if (micEnabled) {
+                if (Build.VERSION.SDK_INT >= 24) micRecorder?.pause()
+            } else {
+                display?.setSurface(null)
+            }
+            paused = true
+            sendStatus(true, true, "Recording paused")
+            updateNotification("Recording paused")
+        } catch (e: Exception) {
+            sendStatus(recording, paused, "Pause failed: ${e.message}")
         }
-
-        try {
-            audioThread?.join(700)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
-        audioThread = null
-
-        try {
-            audioRecord?.release()
-        } catch (_: Exception) {
-        }
-        audioRecord = null
-
-        try {
-            audioCodec?.stop()
-        } catch (_: Exception) {
-        }
-
-        try {
-            audioCodec?.release()
-        } catch (_: Exception) {
-        }
-        audioCodec = null
-        internalAudioEnabled = false
     }
 
-    private fun evenDimension(value: Float): Int {
-        val rounded = value.roundToInt().coerceAtLeast(2)
-        return if (rounded % 2 == 0) rounded else rounded - 1
+    private fun resumeRecording() {
+        if (!recording || !paused) return
+        try {
+            if (micEnabled) {
+                if (Build.VERSION.SDK_INT >= 24) micRecorder?.resume()
+            } else {
+                display?.setSurface(videoSurface)
+            }
+            paused = false
+            sendStatus(true, false, "Recording resumed")
+            updateNotification("Recording in progress")
+        } catch (e: Exception) {
+            sendStatus(recording, paused, "Resume failed: ${e.message}")
+        }
     }
 
-    private fun getScreenMetrics(): DisplayMetrics {
-        val metrics = DisplayMetrics()
-
-        @Suppress("DEPRECATION")
-        val windowManager =
-            getSystemService(Context.WINDOW_SERVICE) as WindowManager
-
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealMetrics(metrics)
-
-        return metrics
-    }
-
-    private fun configureOutput(
-        name: String,
-        mediaRecorder: MediaRecorder
-    ) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+    private fun createOutput(name: String) {
+        if (Build.VERSION.SDK_INT >= 29) {
             val values = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, name)
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                put(
-                    MediaStore.Video.Media.RELATIVE_PATH,
-                    Environment.DIRECTORY_MOVIES + "/GameCast"
-                )
+                put(MediaStore.Video.Media.RELATIVE_PATH,
+                    Environment.DIRECTORY_MOVIES + "/GameCast")
                 put(MediaStore.Video.Media.IS_PENDING, 1)
             }
-
-            val uri = contentResolver.insert(
-                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                values
-            ) ?: throw IllegalStateException("Could not create a video file.")
-
-            outputUri = uri
-
-            outputDescriptor = contentResolver.openFileDescriptor(uri, "w")
-                ?: throw IllegalStateException("Could not open the video file.")
-
-            mediaRecorder.setOutputFile(outputDescriptor!!.fileDescriptor)
-
-            val descriptor = outputDescriptor!!
+            outputUri = contentResolver.insert(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
+            ) ?: error("Could not create video file.")
+            val pfd = contentResolver.openFileDescriptor(outputUri!!, "w")
+                ?: error("Could not open video file.")
+            try {
+                muxer = MediaMuxer(
+                    pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+                )
+            } finally {
+                pfd.close()
+            }
+        } else {
+            val folder = File(
+                getExternalFilesDir(Environment.DIRECTORY_MOVIES), "GameCast"
+            )
+            if (!folder.exists()) check(folder.mkdirs()) {
+                "Could not create output directory."
+            }
+            outputFile = File(folder, name)
             muxer = MediaMuxer(
-                descriptor.fileDescriptor,
+                outputFile!!.absolutePath,
                 MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
             )
-        } else {
-            val directory = File(
-                getExternalFilesDir(Environment.DIRECTORY_MOVIES),
-                "GameCast"
-            )
-
-            if (!directory.exists() && !directory.mkdirs()) {
-                throw IllegalStateException("Could not create the video folder.")
-            }
-
-            val file = File(directory, name)
-            outputFile = file
-            mediaRecorder.setOutputFile(file.absolutePath)
         }
-
         videoTrack = -1
         audioTrack = -1
         muxerStarted = false
     }
 
-    private fun stopRecording(
-        save: Boolean,
-        message: String? = null,
-        stopProjection: Boolean = true
-    ) {
-        var saved = save && recordingStarted
-        val currentRecorder = recorder
-
-        /*
-         * The MediaRecorder file and the internal-audio muxer share a
-         * descriptor but cannot both finalize a valid MP4. Do not attempt
-         * to mux internal audio into the MediaRecorder output.
-         */
-        stopInternalAudioCapture()
-
-        recorder = null
-
-        if (currentRecorder != null) {
-            if (recordingStarted) {
-                try {
-                    currentRecorder.stop()
-                } catch (_: RuntimeException) {
-                    saved = false
-                }
-            }
-
-            try {
-                currentRecorder.reset()
-            } catch (_: Exception) {
-                saved = false
-            }
-
-            try {
-                currentRecorder.release()
-            } catch (_: Exception) {
-                saved = false
-            }
+    private fun stopRecording(save: Boolean, message: String? = null) {
+        if (projection == null && !recording && micRecorder == null) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
         }
 
-        recordingStarted = false
-        paused = false
+        recording = false
+        running.set(false)
+        audioRunning.set(false)
+
+        try { audioRecord?.stop() } catch (_: Exception) {}
+        try { audioThread?.join(500) } catch (_: Exception) {}
+        try { videoThread?.join(500) } catch (_: Exception) {}
+        audioThread = null
+        videoThread = null
+
+        var saved = save
+
+        try { display?.release() } catch (_: Exception) {}
+        display = null
+
+        try { micRecorder?.stop() } catch (_: Exception) {
+            if (micEnabled) saved = false
+        }
+        try { micRecorder?.release() } catch (_: Exception) {}
+        micRecorder = null
+
+        try { audioRecord?.release() } catch (_: Exception) {}
+        audioRecord = null
+
+        try { audioCodec?.stop() } catch (_: Exception) {}
+        try { audioCodec?.release() } catch (_: Exception) {}
+        audioCodec = null
+
+        try { videoCodec?.stop() } catch (_: Exception) {}
+        try { videoCodec?.release() } catch (_: Exception) {}
+        videoCodec = null
+
+        try { videoSurface?.release() } catch (_: Exception) {}
+        videoSurface = null
 
         try {
-            virtualDisplay?.release()
-        } catch (_: Exception) {
-        }
-        virtualDisplay = null
-
-        val currentProjection = projection
-        projection = null
-
-        if (currentProjection != null) {
-            try {
-                currentProjection.unregisterCallback(projectionCallback)
-            } catch (_: Exception) {
-            }
-
-            if (stopProjection) {
-                try {
-                    currentProjection.stop()
-                } catch (_: Exception) {
-                }
-            }
-        }
-
-        try {
-            synchronized(muxerLock) {
-                if (muxerStarted) {
-                    muxer?.stop()
-                }
+            synchronized(muxLock) {
+                if (muxerStarted) muxer?.stop()
                 muxer?.release()
             }
         } catch (_: Exception) {
@@ -790,28 +614,26 @@ class RecordingService : Service() {
         muxerStarted = false
 
         try {
-            outputDescriptor?.close()
-        } catch (_: Exception) {
-        }
-        outputDescriptor = null
+            projection?.unregisterCallback(projectionCallback)
+            projection?.stop()
+        } catch (_: Exception) {}
+        projection = null
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= 29) {
             outputUri?.let { uri ->
                 try {
-                    if (saved) {
+                    if (saved && (!micEnabled && !muxerStarted || micEnabled)) {
                         val values = ContentValues().apply {
                             put(MediaStore.Video.Media.IS_PENDING, 0)
                         }
                         contentResolver.update(uri, values, null, null)
                     } else {
                         contentResolver.delete(uri, null, null)
+                        saved = false
                     }
                 } catch (_: Exception) {
                     saved = false
-                    try {
-                        contentResolver.delete(uri, null, null)
-                    } catch (_: Exception) {
-                    }
+                    try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
                 }
             }
         } else if (!saved) {
@@ -820,87 +642,75 @@ class RecordingService : Service() {
 
         outputUri = null
         outputFile = null
+        paused = false
+        internalAudio = false
+        micEnabled = false
 
-        val finalMessage = message ?: if (saved) {
-            "Recording saved to Movies/GameCast"
-        } else {
-            "Recording stopped. The video could not be saved."
-        }
-
-        sendStatus(false, false, finalMessage)
-
-        try {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } catch (_: Exception) {
-        }
-
+        sendStatus(
+            false, false,
+            message ?: if (saved) "Recording saved to Movies/GameCast"
+            else "Recording could not be saved."
+        )
+        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    private fun sendStatus(
-        recording: Boolean,
-        isPaused: Boolean,
-        message: String
-    ) {
-        val statusIntent = Intent(ACTION_STATUS).apply {
-            setPackage(packageName)
-            putExtra(EXTRA_RECORDING, recording)
+    private fun qualityLongEdgeBitrate(label: String): Int = when (label) {
+        "480p" -> 2_000_000
+        "540p" -> 3_000_000
+        "720p" -> 5_000_000
+        "1080p" -> 8_000_000
+        "2K" -> 12_000_000
+        else -> 8_000_000
+    }
+
+    private fun even(value: Float): Int {
+        val rounded = value.roundToInt().coerceAtLeast(2)
+        return if (rounded % 2 == 0) rounded else rounded - 1
+    }
+
+    private fun getDensity(): Int {
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        (getSystemService(WINDOW_SERVICE) as WindowManager)
+            .defaultDisplay.getRealMetrics(metrics)
+        return metrics.densityDpi
+    }
+
+    private fun sendStatus(isRecording: Boolean, isPaused: Boolean, message: String) {
+        sendBroadcast(Intent(ACTION_STATUS).setPackage(packageName).apply {
+            putExtra(EXTRA_RECORDING, isRecording)
             putExtra(EXTRA_PAUSED, isPaused)
             putExtra(EXTRA_MESSAGE, message)
-        }
-        sendBroadcast(statusIntent)
+        })
     }
 
-    private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "GameCast Recording",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Screen recording status"
-        }
-
-        getSystemService(NotificationManager::class.java)
-            .createNotificationChannel(channel)
-    }
-
-    private fun createNotification(message: String): Notification {
+    private fun notification(message: String): Notification {
         val stopIntent = Intent(this, RecordingService::class.java).apply {
             action = ACTION_STOP
         }
-
-        val stopPendingIntent = PendingIntent.getService(
-            this,
-            4102,
-            stopIntent,
+        val pending = PendingIntent.getService(
+            this, 4102, stopIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setContentTitle("GameCast Screen Recorder")
             .setContentText(message)
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .addAction(
-                android.R.drawable.ic_media_pause,
-                "Stop",
-                stopPendingIntent
-            )
+            .addAction(android.R.drawable.ic_media_pause, "Stop", pending)
             .build()
     }
 
     private fun updateNotification(message: String) {
         getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, createNotification(message))
+            .notify(NOTIFICATION_ID, notification(message))
     }
 
     override fun onDestroy() {
-        if (recorder != null || projection != null) {
-            stopRecording(
-                save = false,
-                message = "Recording service closed unexpectedly"
-            )
+        if (projection != null || micRecorder != null) {
+            stopRecording(false, "Recording service closed")
         }
         super.onDestroy()
     }
