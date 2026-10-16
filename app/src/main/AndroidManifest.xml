@@ -21,8 +21,23 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ScreenshotActivity"
+            android:exported="true"
+            android:label="GameCast Screenshots">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".RecordingService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <service
+            android:name=".ScreenshotService"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
 
