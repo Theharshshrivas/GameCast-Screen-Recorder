@@ -1,7 +1,6 @@
 
 package com.gamecast.recorder
 
-import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -28,12 +27,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 
 class FloatingControlsActivity : ComponentActivity() {
 
     private var permissionGranted by mutableStateOf(false)
-    private var message by mutableStateOf("Floating controls need overlay permission.")
+    private var message by mutableStateOf("Checking overlay permission...")
 
     private val settingsLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -101,7 +99,8 @@ class FloatingControlsActivity : ComponentActivity() {
 
                         Spacer(Modifier.height(16.dp))
                         Text(
-                            "The overlay can appear over other apps. Use it only when you want quick recording controls."
+                            "Floating controls can appear over other apps. " +
+                                "Allow this permission only if you want to use them."
                         )
                     }
                 }
@@ -124,13 +123,14 @@ class FloatingControlsActivity : ComponentActivity() {
     }
 
     private fun updatePermissionStatus() {
-        permissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
-            Settings.canDrawOverlays(this)
+        permissionGranted =
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+                Settings.canDrawOverlays(this)
 
         message = if (permissionGranted) {
-            "Permission granted. You can show the floating controls."
+            "Permission granted. You can show floating controls."
         } else {
-            "Permission is not enabled yet."
+            "Overlay permission is not enabled."
         }
     }
 
@@ -141,15 +141,18 @@ class FloatingControlsActivity : ComponentActivity() {
         }
 
         try {
-            ContextCompat.startForegroundService(
-                this,
-                Intent(this, FloatingControlsService::class.java).apply {
+            startService(
+                Intent(
+                    this,
+                    FloatingControlsService::class.java
+                ).apply {
                     action = FloatingControlsService.ACTION_SHOW
                 }
             )
             message = "Floating controls start requested."
         } catch (e: Exception) {
-            message = "Could not start controls: ${e.message ?: "Unknown error"}"
+            message = "Could not start controls: " +
+                (e.message ?: "Unknown error")
         }
     }
 
