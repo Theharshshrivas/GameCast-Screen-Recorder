@@ -1,11 +1,13 @@
 
 package com.gamecast.recorder
 
+import android.Manifest
 import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -23,6 +25,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -39,11 +42,17 @@ class MainActivity : ComponentActivity() {
     private lateinit var screenCaptureLauncher:
         ActivityResultLauncher<Intent>
 
+    private lateinit var microphonePermissionLauncher:
+        ActivityResultLauncher<String>
+
+    private var micEnabled by mutableStateOf(true)
     private var isRecording by mutableStateOf(false)
     private var isPaused by mutableStateOf(false)
     private var statusMessage by mutableStateOf(
         "Ready to record your screen"
     )
+
+    private var waitingForMicPermission = false
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -70,10 +79,34 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        microphonePermissionLauncher =
+            registerForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) { granted ->
+                if (waitingForMicPermission) {
+                    waitingForMicPermission = false
+
+                    if (granted) {
+                        launchScreenCapture()
+                    } else {
+                        statusMessage =
+                            "Microphone permission denied. Turn mic off to record video without voice."
+                    }
+                    return@registerForActivityResult
+                }
+
+                if (!granted) {
+                    micEnabled = false
+                    statusMessage =
+                        "Microphone unavailable. Video-only recording is selected."
+                }
+            }
+
         screenCaptureLauncher = registerForActivityResult(
             ActivityResultContracts.StartActivityForResult()
         ) { result ->
-            if (result.resultCode == Activity.RESULT_OK &&
+            if (
+                result.resultCode == Activity.RESULT_OK &&
                 result.data != null
             ) {
                 val serviceIntent = Intent(
@@ -89,15 +122,21 @@ class MainActivity : ComponentActivity() {
                         RecordingService.EXTRA_PROJECTION_DATA,
                         result.data
                     )
+                    putExtra(
+                        RecordingService.EXTRA_MIC_ENABLED,
+                        micEnabled
+                    )
                 }
 
                 ContextCompat.startForegroundService(
                     this,
                     serviceIntent
                 )
+
                 statusMessage = "Starting screen recording..."
             } else {
-                statusMessage = "Screen recording permission was cancelled"
+                statusMessage =
+                    "Screen recording permission was cancelled"
             }
         }
 
@@ -141,12 +180,60 @@ class MainActivity : ComponentActivity() {
                             fontSize = 15.sp
                         )
 
-                        Spacer(modifier = Modifier.height(28.dp))
+                        Spacer(modifier = Modifier.height(24.dp))
 
                         Text(
                             text = statusMessage,
                             style = MaterialTheme.typography.bodyMedium
                         )
+
+                        Spacer(modifier = Modifier.height(20.dp))
+
+                        androidx.compose.foundation.layout.Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement =
+                                Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text(
+                                    text = "Microphone audio",
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = if (micEnabled) {
+                                        "Voice capture enabled"
+                                    } else {
+                                        "Video only"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+
+                            Switch(
+                                checked = micEnabled,
+                                enabled = !isRecording,
+                                onCheckedChange = { enabled ->
+                                    if (enabled) {
+                                        val granted =
+                                            ContextCompat.checkSelfPermission(
+                                                this@MainActivity,
+                                                Manifest.permission.RECORD_AUDIO
+                                            ) == PackageManager.PERMISSION_GRANTED
+
+                                        if (granted) {
+                                            micEnabled = true
+                                        } else {
+                                            microphonePermissionLauncher.launch(
+                                                Manifest.permission.RECORD_AUDIO
+                                            )
+                                        }
+                                    } else {
+                                        micEnabled = false
+                                    }
+                                }
+                            )
+                        }
 
                         Spacer(modifier = Modifier.height(20.dp))
 
@@ -198,7 +285,7 @@ class MainActivity : ComponentActivity() {
                         OutlinedButton(
                             onClick = {
                                 statusMessage =
-                                    "My Recordings will be implemented in Phase 3."
+                                    "Recordings gallery is planned for Phase 3."
                             },
                             modifier = Modifier.fillMaxWidth()
                         ) {
@@ -215,7 +302,7 @@ class MainActivity : ComponentActivity() {
                         Spacer(modifier = Modifier.height(8.dp))
 
                         Text(
-                            text = "Phase 1 • Screen Video Capture",
+                            text = "Phase 2 • Microphone Audio",
                             fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -226,18 +313,41 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestScreenCapture() {
+        if (micEnabled) {
+            val granted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+
+            if (!granted) {
+                waitingForMicPermission = true
+                microphonePermissionLauncher.launch(
+                    Manifest.permission.RECORD_AUDIO
+                )
+                return
+            }
+        }
+
+        launchScreenCapture()
+    }
+
+    private fun launchScreenCapture() {
         val manager = getSystemService(
             Context.MEDIA_PROJECTION_SERVICE
         ) as MediaProjectionManager
 
         statusMessage = "Waiting for screen capture permission..."
+
         screenCaptureLauncher.launch(
             manager.createScreenCaptureIntent()
         )
     }
 
     private fun sendRecordingAction(action: String) {
-        val intent = Intent(this, RecordingService::class.java).apply {
+        val intent = Intent(
+            this,
+            RecordingService::class.java
+        ).apply {
             this.action = action
         }
 
@@ -245,7 +355,11 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        unregisterReceiver(statusReceiver)
+        try {
+            unregisterReceiver(statusReceiver)
+        } catch (_: IllegalArgumentException) {
+        }
+
         super.onDestroy()
     }
 }
