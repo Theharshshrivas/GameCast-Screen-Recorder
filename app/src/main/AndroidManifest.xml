@@ -10,6 +10,8 @@
     <application
         android:allowBackup="false"
         android:label="GameCast Screen Recorder"
+        android:icon="@mipmap/gamecast_app_icon"
+        android:roundIcon="@mipmap/gamecast_app_icon"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
@@ -25,32 +27,17 @@
         <activity
             android:name=".StorageDashboardActivity"
             android:exported="true"
-            android:label="GameCast Tools">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+            android:label="GameCast Tools" />
 
         <activity
             android:name=".ScreenshotActivity"
             android:exported="true"
-            android:label="GameCast Screenshots">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+            android:label="GameCast Screenshots" />
 
         <activity
             android:name=".FloatingControlsActivity"
             android:exported="true"
-            android:label="GameCast Floating Controls">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+            android:label="GameCast Floating Controls" />
 
         <service
             android:name=".RecordingService"
