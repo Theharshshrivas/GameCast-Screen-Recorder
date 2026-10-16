@@ -25,7 +25,6 @@ import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.DisplayMetrics
 import android.view.WindowManager
-import android.content.res.Resources
 import androidx.core.app.NotificationCompat
 import java.io.File
 import java.text.SimpleDateFormat
@@ -43,6 +42,7 @@ class RecordingService : Service() {
 
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_PROJECTION_DATA = "projection_data"
+        const val EXTRA_MIC_ENABLED = "mic_enabled"
         const val EXTRA_RECORDING = "recording"
         const val EXTRA_PAUSED = "paused"
         const val EXTRA_MESSAGE = "message"
@@ -103,7 +103,9 @@ class RecordingService : Service() {
                             )
                         } else {
                             @Suppress("DEPRECATION")
-                            intent.getParcelableExtra(EXTRA_PROJECTION_DATA)
+                            intent.getParcelableExtra(
+                                EXTRA_PROJECTION_DATA
+                            )
                         }
 
                     if (resultData == null) {
@@ -112,7 +114,16 @@ class RecordingService : Service() {
                         )
                     }
 
-                    startRecording(resultCode, resultData)
+                    val micEnabled = intent.getBooleanExtra(
+                        EXTRA_MIC_ENABLED,
+                        false
+                    )
+
+                    startRecording(
+                        resultCode,
+                        resultData,
+                        micEnabled
+                    )
                 } catch (e: Exception) {
                     stopRecording(
                         save = false,
@@ -122,9 +133,7 @@ class RecordingService : Service() {
                 }
             }
 
-            ACTION_STOP -> {
-                stopRecording(save = true)
-            }
+            ACTION_STOP -> stopRecording(save = true)
 
             ACTION_PAUSE -> {
                 try {
@@ -180,7 +189,8 @@ class RecordingService : Service() {
 
     private fun startRecording(
         resultCode: Int,
-        resultData: Intent
+        resultData: Intent,
+        micEnabled: Boolean
     ) {
         val manager = getSystemService(
             Context.MEDIA_PROJECTION_SERVICE
@@ -222,14 +232,25 @@ class RecordingService : Service() {
         recorder = mediaRecorder
 
         mediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+
+        if (micEnabled) {
+            mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+        }
+
         mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
         mediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+
+        if (micEnabled) {
+            mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            mediaRecorder.setAudioEncodingBitRate(128_000)
+            mediaRecorder.setAudioSamplingRate(44_100)
+        }
+
         mediaRecorder.setVideoSize(width, height)
         mediaRecorder.setVideoFrameRate(30)
         mediaRecorder.setVideoEncodingBitRate(8_000_000)
 
         configureOutput(name, mediaRecorder)
-
         mediaRecorder.prepare()
 
         virtualDisplay = projection?.createVirtualDisplay(
@@ -249,24 +270,25 @@ class RecordingService : Service() {
         recordingStarted = true
         paused = false
 
-        sendStatus(true, false, "Recording in progress")
+        val message = if (micEnabled) {
+            "Recording screen with microphone audio"
+        } else {
+            "Recording screen without microphone audio"
+        }
+
+        sendStatus(true, false, message)
         updateNotification("Recording in progress")
     }
 
     private fun getScreenMetrics(): DisplayMetrics {
         val metrics = DisplayMetrics()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = Resources.getSystem().displayMetrics
-            metrics.setTo(bounds)
-        } else {
-            @Suppress("DEPRECATION")
-            val windowManager =
-                getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        @Suppress("DEPRECATION")
+        val windowManager =
+            getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
-            @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.getRealMetrics(metrics)
-        }
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(metrics)
 
         return metrics
     }
@@ -348,7 +370,11 @@ class RecordingService : Service() {
                 saved = false
             }
 
-            currentRecorder.release()
+            try {
+                currentRecorder.release()
+            } catch (_: Exception) {
+                saved = false
+            }
         }
 
         recordingStarted = false
@@ -396,6 +422,10 @@ class RecordingService : Service() {
                     }
                 } catch (_: Exception) {
                     saved = false
+                    try {
+                        contentResolver.delete(uri, null, null)
+                    } catch (_: Exception) {
+                    }
                 }
             }
         } else if (!saved) {
@@ -445,9 +475,7 @@ class RecordingService : Service() {
             description = "Screen recording status"
         }
 
-        val manager = getSystemService(
-            NotificationManager::class.java
-        )
+        val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(channel)
     }
 
@@ -479,9 +507,7 @@ class RecordingService : Service() {
     }
 
     private fun updateNotification(message: String) {
-        val manager = getSystemService(
-            NotificationManager::class.java
-        )
+        val manager = getSystemService(NotificationManager::class.java)
         manager.notify(NOTIFICATION_ID, createNotification(message))
     }
 
