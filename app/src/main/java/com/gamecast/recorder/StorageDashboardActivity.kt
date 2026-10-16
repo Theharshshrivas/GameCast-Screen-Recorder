@@ -2,13 +2,13 @@
 package com.gamecast.recorder
 
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -23,7 +23,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -50,10 +49,8 @@ class StorageDashboardActivity : ComponentActivity() {
                             .padding(20.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Text(
-                            "GameCast Tools",
-                            fontSize = 27.sp
-                        )
+                        Text("GameCast Tools", fontSize = 27.sp)
+
                         Text(
                             "Storage overview and quick access",
                             style = MaterialTheme.typography.bodyMedium
@@ -141,9 +138,10 @@ class StorageDashboardActivity : ComponentActivity() {
                         }
 
                         Spacer(Modifier.height(4.dp))
+
                         Text(
-                            "Storage totals include media items visible to GameCast. " +
-                                "They are not a measurement of all free space on your phone.",
+                            "These totals cover media visible to GameCast, " +
+                                "not all free space on your phone.",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
@@ -158,6 +156,16 @@ class StorageDashboardActivity : ComponentActivity() {
     }
 
     private fun refreshStorage() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            videoCount = 0
+            screenshotCount = 0
+            videoBytes = 0L
+            screenshotBytes = 0L
+            status = "Folder statistics require Android 10 or newer. " +
+                "Other GameCast tools remain available."
+            return
+        }
+
         val videos = queryMedia(
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
             MediaStore.Video.Media.SIZE,
@@ -188,12 +196,10 @@ class StorageDashboardActivity : ComponentActivity() {
         var count = 0
         var bytes = 0L
 
-        val projection = arrayOf(sizeColumn, pathColumn)
-
         try {
             contentResolver.query(
                 collection,
-                projection,
+                arrayOf(sizeColumn, pathColumn),
                 null,
                 null,
                 null
@@ -201,24 +207,23 @@ class StorageDashboardActivity : ComponentActivity() {
                 val sizeIndex = cursor.getColumnIndex(sizeColumn)
                 val pathIndex = cursor.getColumnIndex(pathColumn)
 
+                if (sizeIndex < 0 || pathIndex < 0) {
+                    return 0 to 0L
+                }
+
                 while (cursor.moveToNext()) {
-                    val path = if (pathIndex >= 0) {
-                        cursor.getString(pathIndex).orEmpty()
-                    } else {
-                        ""
-                    }
+                    val path = cursor.getString(pathIndex).orEmpty()
 
                     if (path.startsWith(expectedPath, ignoreCase = true)) {
                         count++
-                        if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
+                        if (!cursor.isNull(sizeIndex)) {
                             bytes += cursor.getLong(sizeIndex).coerceAtLeast(0L)
                         }
                     }
                 }
             }
         } catch (e: Exception) {
-            status = "Could not read some media information: " +
-                (e.message ?: "Access unavailable")
+            status = "Some storage information could not be read."
         }
 
         return count to bytes
@@ -229,13 +234,13 @@ class StorageDashboardActivity : ComponentActivity() {
 
         val units = arrayOf("KB", "MB", "GB", "TB")
         var value = bytes.toDouble()
-        var unitIndex = -1
+        var index = -1
 
-        while (value >= 1024.0 && unitIndex < units.lastIndex) {
+        while (value >= 1024.0 && index < units.lastIndex) {
             value /= 1024.0
-            unitIndex++
+            index++
         }
 
-        return String.format(Locale.US, "%.2f %s", value, units[unitIndex])
+        return String.format(Locale.US, "%.2f %s", value, units[index])
     }
 }
