@@ -1,7 +1,6 @@
 
 package com.gamecast.recorder
 
-import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -20,7 +19,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import java.io.File
@@ -31,8 +29,10 @@ import java.util.Locale
 class ScreenshotService : Service() {
 
     companion object {
-        const val ACTION_CAPTURE = "com.gamecast.recorder.CAPTURE_SCREENSHOT"
-        const val ACTION_RESULT = "com.gamecast.recorder.SCREENSHOT_RESULT"
+        const val ACTION_CAPTURE =
+            "com.gamecast.recorder.CAPTURE_SCREENSHOT"
+        const val ACTION_RESULT =
+            "com.gamecast.recorder.SCREENSHOT_RESULT"
         const val EXTRA_RESULT_CODE = "screenshot_result_code"
         const val EXTRA_PROJECTION_DATA = "screenshot_projection_data"
         const val EXTRA_MESSAGE = "screenshot_message"
@@ -46,13 +46,13 @@ class ScreenshotService : Service() {
     private var reader: ImageReader? = null
     private var outputUri: Uri? = null
     private var outputFile: File? = null
-    private var descriptor: ParcelFileDescriptor? = null
     private var finished = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+
         val channel = NotificationChannel(
             CHANNEL_ID,
             "GameCast Screenshot Capture",
@@ -90,24 +90,42 @@ class ScreenshotService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
 
-            val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
-            val data: Intent? = if (Build.VERSION.SDK_INT >= 33) {
-                intent.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(EXTRA_PROJECTION_DATA)
-            } ?: throw IllegalStateException("Screen permission data missing")
+            val serviceIntent = intent
+            val resultCode =
+                serviceIntent.getIntExtra(EXTRA_RESULT_CODE, 0)
+
+            val data: Intent =
+                (
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        serviceIntent.getParcelableExtra(
+                            EXTRA_PROJECTION_DATA,
+                            Intent::class.java
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        serviceIntent.getParcelableExtra<Intent>(
+                            EXTRA_PROJECTION_DATA
+                        )
+                    }
+                ) ?: throw IllegalStateException(
+                    "Screen permission data missing"
+                )
 
             val manager = getSystemService(
                 Context.MEDIA_PROJECTION_SERVICE
             ) as MediaProjectionManager
 
             projection = manager.getMediaProjection(resultCode, data)
-                ?: throw IllegalStateException("Screen capture unavailable")
+                ?: throw IllegalStateException(
+                    "Screen capture unavailable"
+                )
 
             captureOneFrame()
         } catch (e: Exception) {
-            finishCapture(false, "Screenshot failed: ${e.message ?: "Unknown error"}")
+            finishCapture(
+                false,
+                "Screenshot failed: ${e.message ?: "Unknown error"}"
+            )
         }
 
         return START_NOT_STICKY
@@ -126,7 +144,8 @@ class ScreenshotService : Service() {
             2
         )
 
-        val currentReader = reader ?: throw IllegalStateException("ImageReader unavailable")
+        val currentReader = reader
+            ?: throw IllegalStateException("ImageReader unavailable")
         val currentProjection = projection
             ?: throw IllegalStateException("Screen projection unavailable")
 
@@ -134,7 +153,10 @@ class ScreenshotService : Service() {
             object : MediaProjection.Callback() {
                 override fun onStop() {
                     if (!finished) {
-                        finishCapture(false, "Screen capture was stopped")
+                        finishCapture(
+                            false,
+                            "Screen capture was stopped"
+                        )
                     }
                 }
             },
@@ -150,60 +172,82 @@ class ScreenshotService : Service() {
             currentReader.surface,
             null,
             Handler(Looper.getMainLooper())
-        ) ?: throw IllegalStateException("Could not create screen display")
+        ) ?: throw IllegalStateException(
+            "Could not create screen display"
+        )
 
-        currentReader.setOnImageAvailableListener({ imageReader ->
-            if (finished) return@setOnImageAvailableListener
+        currentReader.setOnImageAvailableListener(
+            { imageReader ->
+                if (finished) {
+                    return@setOnImageAvailableListener
+                }
 
-            val image = imageReader.acquireLatestImage() ?: return@setOnImageAvailableListener
-            try {
-                val plane = image.planes[0]
-                val pixelStride = plane.pixelStride
-                val rowStride = plane.rowStride
-                val rowPadding = rowStride - pixelStride * image.width
+                val image = imageReader.acquireLatestImage()
+                    ?: return@setOnImageAvailableListener
 
-                val paddedBitmap = Bitmap.createBitmap(
-                    image.width + rowPadding / pixelStride,
-                    image.height,
-                    Bitmap.Config.ARGB_8888
-                )
+                try {
+                    val plane = image.planes[0]
+                    val pixelStride = plane.pixelStride
+                    val rowStride = plane.rowStride
+                    val rowPadding =
+                        rowStride - pixelStride * image.width
 
-                paddedBitmap.copyPixelsFromBuffer(plane.buffer)
+                    val paddedBitmap = Bitmap.createBitmap(
+                        image.width + rowPadding / pixelStride,
+                        image.height,
+                        Bitmap.Config.ARGB_8888
+                    )
 
-                val bitmap = Bitmap.createBitmap(
-                    paddedBitmap,
-                    0,
-                    0,
-                    image.width,
-                    image.height
-                )
-                paddedBitmap.recycle()
+                    paddedBitmap.copyPixelsFromBuffer(plane.buffer)
 
-                val saved = saveBitmap(bitmap)
-                bitmap.recycle()
+                    val bitmap = Bitmap.createBitmap(
+                        paddedBitmap,
+                        0,
+                        0,
+                        image.width,
+                        image.height
+                    )
+                    paddedBitmap.recycle()
 
-                finishCapture(
-                    saved,
-                    if (saved) "Screenshot saved to Pictures/GameCast"
-                    else "Could not save screenshot"
-                )
-            } catch (e: Exception) {
-                finishCapture(false, "Screenshot failed: ${e.message ?: "Unknown error"}")
-            } finally {
-                image.close()
-            }
-        }, Handler(Looper.getMainLooper()))
+                    val saved = saveBitmap(bitmap)
+                    bitmap.recycle()
+
+                    finishCapture(
+                        saved,
+                        if (saved) {
+                            "Screenshot saved to Pictures/GameCast"
+                        } else {
+                            "Could not save screenshot"
+                        }
+                    )
+                } catch (e: Exception) {
+                    finishCapture(
+                        false,
+                        "Screenshot failed: ${e.message ?: "Unknown error"}"
+                    )
+                } finally {
+                    image.close()
+                }
+            },
+            Handler(Looper.getMainLooper())
+        )
 
         Handler(Looper.getMainLooper()).postDelayed({
             if (!finished) {
-                finishCapture(false, "Screen image was not received. Try again.")
+                finishCapture(
+                    false,
+                    "Screen image was not received. Try again."
+                )
             }
         }, 5000)
     }
 
     private fun saveBitmap(bitmap: Bitmap): Boolean {
         val name = "GameCast_" +
-            SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) +
+            SimpleDateFormat(
+                "yyyyMMdd_HHmmss",
+                Locale.US
+            ).format(Date()) +
             ".png"
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -225,12 +269,23 @@ class ScreenshotService : Service() {
             outputUri = uri
 
             try {
-                contentResolver.openOutputStream(uri, "w")?.use { stream ->
-                    if (stream == null) throw IllegalStateException("File stream unavailable")
-                    if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)) {
-                        throw IllegalStateException("PNG encoding failed")
+                val stream = contentResolver.openOutputStream(uri, "w")
+                    ?: throw IllegalStateException(
+                        "Could not open screenshot file"
+                    )
+
+                stream.use {
+                    if (!bitmap.compress(
+                            Bitmap.CompressFormat.PNG,
+                            100,
+                            it
+                        )
+                    ) {
+                        throw IllegalStateException(
+                            "PNG encoding failed"
+                        )
                     }
-                } ?: throw IllegalStateException("Could not open screenshot file")
+                }
 
                 contentResolver.update(
                     uri,
@@ -247,19 +302,33 @@ class ScreenshotService : Service() {
             }
         } else {
             val directory = File(
-                getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES),
+                getExternalFilesDir(
+                    android.os.Environment.DIRECTORY_PICTURES
+                ),
                 "GameCast"
             )
 
-            if (!directory.exists() && !directory.mkdirs()) return false
+            if (!directory.exists() && !directory.mkdirs()) {
+                return false
+            }
 
             val file = File(directory, name)
             outputFile = file
 
             try {
                 file.outputStream().use { stream ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                    if (!bitmap.compress(
+                            Bitmap.CompressFormat.PNG,
+                            100,
+                            stream
+                        )
+                    ) {
+                        throw IllegalStateException(
+                            "PNG encoding failed"
+                        )
+                    }
                 }
+                true
             } catch (_: Exception) {
                 file.delete()
                 false
@@ -267,7 +336,10 @@ class ScreenshotService : Service() {
         }
     }
 
-    private fun finishCapture(success: Boolean, message: String) {
+    private fun finishCapture(
+        success: Boolean,
+        message: String
+    ) {
         if (finished) return
         finished = true
 
@@ -290,16 +362,10 @@ class ScreenshotService : Service() {
         }
         projection = null
 
-        try {
-            descriptor?.close()
-        } catch (_: Exception) {
-        }
-        descriptor = null
-
         if (!success) {
-            outputUri?.let {
+            outputUri?.let { uri ->
                 try {
-                    contentResolver.delete(it, null, null)
+                    contentResolver.delete(uri, null, null)
                 } catch (_: Exception) {
                 }
             }
@@ -319,7 +385,10 @@ class ScreenshotService : Service() {
 
     override fun onDestroy() {
         if (!finished) {
-            finishCapture(false, "Screenshot service stopped")
+            finishCapture(
+                false,
+                "Screenshot service stopped"
+            )
         }
         super.onDestroy()
     }
