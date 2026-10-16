@@ -40,6 +40,11 @@
             android:label="GameCast Screenshots" />
 
         <activity
+            android:name=".RecycleBinActivity"
+            android:exported="false"
+            android:label="GameCast Recycle Bin" />
+
+        <activity
             android:name=".FloatingControlsActivity"
             android:exported="true"
             android:label="GameCast Floating Controls" />
