@@ -30,6 +30,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.roundToInt
 
 class RecordingService : Service() {
 
@@ -43,12 +44,15 @@ class RecordingService : Service() {
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_PROJECTION_DATA = "projection_data"
         const val EXTRA_MIC_ENABLED = "mic_enabled"
+        const val EXTRA_QUALITY_LONG_EDGE = "quality_long_edge"
+        const val EXTRA_QUALITY_LABEL = "quality_label"
         const val EXTRA_RECORDING = "recording"
         const val EXTRA_PAUSED = "paused"
         const val EXTRA_MESSAGE = "message"
 
         private const val CHANNEL_ID = "gamecast_recording"
         private const val NOTIFICATION_ID = 4101
+        private const val DEFAULT_LONG_EDGE = 1920
     }
 
     private var projection: MediaProjection? = null
@@ -57,7 +61,6 @@ class RecordingService : Service() {
     private var outputUri: Uri? = null
     private var outputFile: File? = null
     private var outputDescriptor: ParcelFileDescriptor? = null
-
     private var recordingStarted = false
     private var paused = false
 
@@ -92,8 +95,9 @@ class RecordingService : Service() {
                 try {
                     startAsForeground()
 
-                    val resultCode =
-                        intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+                    val resultCode = intent.getIntExtra(
+                        EXTRA_RESULT_CODE, 0
+                    )
 
                     val resultData: Intent? =
                         if (Build.VERSION.SDK_INT >= 33) {
@@ -103,9 +107,7 @@ class RecordingService : Service() {
                             )
                         } else {
                             @Suppress("DEPRECATION")
-                            intent.getParcelableExtra(
-                                EXTRA_PROJECTION_DATA
-                            )
+                            intent.getParcelableExtra(EXTRA_PROJECTION_DATA)
                         }
 
                     if (resultData == null) {
@@ -114,15 +116,18 @@ class RecordingService : Service() {
                         )
                     }
 
-                    val micEnabled = intent.getBooleanExtra(
-                        EXTRA_MIC_ENABLED,
-                        false
-                    )
-
                     startRecording(
-                        resultCode,
-                        resultData,
-                        micEnabled
+                        resultCode = resultCode,
+                        resultData = resultData,
+                        micEnabled = intent.getBooleanExtra(
+                            EXTRA_MIC_ENABLED, false
+                        ),
+                        requestedLongEdge = intent.getIntExtra(
+                            EXTRA_QUALITY_LONG_EDGE, DEFAULT_LONG_EDGE
+                        ),
+                        qualityLabel = intent.getStringExtra(
+                            EXTRA_QUALITY_LABEL
+                        ) ?: "1080p"
                     )
                 } catch (e: Exception) {
                     stopRecording(
@@ -190,7 +195,9 @@ class RecordingService : Service() {
     private fun startRecording(
         resultCode: Int,
         resultData: Intent,
-        micEnabled: Boolean
+        micEnabled: Boolean,
+        requestedLongEdge: Int,
+        qualityLabel: String
     ) {
         val manager = getSystemService(
             Context.MEDIA_PROJECTION_SERVICE
@@ -207,12 +214,24 @@ class RecordingService : Service() {
         )
 
         val metrics = getScreenMetrics()
-        val width = (metrics.widthPixels / 2) * 2
-        val height = (metrics.heightPixels / 2) * 2
+        val sourceWidth = metrics.widthPixels
+        val sourceHeight = metrics.heightPixels
         val density = metrics.densityDpi
 
-        if (width <= 0 || height <= 0) {
+        if (sourceWidth <= 0 || sourceHeight <= 0) {
             throw IllegalStateException("Invalid screen dimensions.")
+        }
+
+        val sourceLongEdge = maxOf(sourceWidth, sourceHeight).toFloat()
+        val sourceShortEdge = minOf(sourceWidth, sourceHeight).toFloat()
+        val requestedEdge = requestedLongEdge.coerceIn(854, 2560)
+        val scale = minOf(1f, requestedEdge / sourceLongEdge)
+
+        val width = evenDimension(sourceWidth * scale)
+        val height = evenDimension(sourceHeight * scale)
+
+        if (width <= 0 || height <= 0) {
+            throw IllegalStateException("Invalid output dimensions.")
         }
 
         val name = "GameCast_" +
@@ -248,7 +267,17 @@ class RecordingService : Service() {
 
         mediaRecorder.setVideoSize(width, height)
         mediaRecorder.setVideoFrameRate(30)
-        mediaRecorder.setVideoEncodingBitRate(8_000_000)
+
+        val videoBitRate = when (qualityLabel) {
+            "480p" -> 2_000_000
+            "540p" -> 3_000_000
+            "720p" -> 5_000_000
+            "1080p" -> 8_000_000
+            "2K" -> 12_000_000
+            else -> 8_000_000
+        }
+
+        mediaRecorder.setVideoEncodingBitRate(videoBitRate)
 
         configureOutput(name, mediaRecorder)
         mediaRecorder.prepare()
@@ -270,14 +299,23 @@ class RecordingService : Service() {
         recordingStarted = true
         paused = false
 
-        val message = if (micEnabled) {
-            "Recording screen with microphone audio"
+        val audioDescription = if (micEnabled) {
+            "with microphone audio"
         } else {
-            "Recording screen without microphone audio"
+            "without microphone audio"
         }
 
-        sendStatus(true, false, message)
-        updateNotification("Recording in progress")
+        sendStatus(
+            true,
+            false,
+            "Recording $qualityLabel ($width × $height), $audioDescription"
+        )
+        updateNotification("Recording in progress • $qualityLabel")
+    }
+
+    private fun evenDimension(value: Float): Int {
+        val rounded = value.roundToInt().coerceAtLeast(2)
+        return if (rounded % 2 == 0) rounded else rounded - 1
     }
 
     private fun getScreenMetrics(): DisplayMetrics {
@@ -317,12 +355,10 @@ class RecordingService : Service() {
 
             outputUri = uri
 
-            outputDescriptor = contentResolver.openFileDescriptor(
-                uri,
-                "w"
-            ) ?: throw IllegalStateException(
-                "Could not open the video file."
-            )
+            outputDescriptor = contentResolver.openFileDescriptor(uri, "w")
+                ?: throw IllegalStateException(
+                    "Could not open the video file."
+                )
 
             mediaRecorder.setOutputFile(
                 outputDescriptor!!.fileDescriptor
@@ -462,7 +498,6 @@ class RecordingService : Service() {
             putExtra(EXTRA_PAUSED, isPaused)
             putExtra(EXTRA_MESSAGE, message)
         }
-
         sendBroadcast(statusIntent)
     }
 
@@ -475,8 +510,8 @@ class RecordingService : Service() {
             description = "Screen recording status"
         }
 
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(channel)
+        getSystemService(NotificationManager::class.java)
+            .createNotificationChannel(channel)
     }
 
     private fun createNotification(message: String): Notification {
@@ -507,8 +542,8 @@ class RecordingService : Service() {
     }
 
     private fun updateNotification(message: String) {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, createNotification(message))
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, createNotification(message))
     }
 
     override fun onDestroy() {
