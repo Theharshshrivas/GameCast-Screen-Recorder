@@ -1,4 +1,3 @@
-
 package com.gamecast.recorder
 
 import android.Manifest
@@ -188,13 +187,18 @@ class MainActivity : ComponentActivity() {
         mediaChangeLauncher = registerForActivityResult(
             ActivityResultContracts.StartIntentSenderForResult()
         ) { result ->
+            val deletedItem = pendingDelete
+
             if (result.resultCode == Activity.RESULT_OK) {
                 pendingRename?.let { item ->
                     pendingRenameValue?.let { name ->
                         renameRecording(item, name, false)
                     }
                 }
-                pendingDelete?.let { deleteRecording(it, false) }
+
+                if (deletedItem != null) {
+                    statusMessage = "Recording moved to Recycle Bin."
+                }
             } else {
                 statusMessage = "Media change cancelled."
             }
@@ -258,10 +262,14 @@ class MainActivity : ComponentActivity() {
                         AlertDialog(
                             onDismissRequest = { deleteTarget = null },
                             containerColor = CardBg,
-                            title = { Text("Delete recording?", color = Ink) },
+                            title = { Text("Move recording to Bin?", color = Ink) },
                             text = {
                                 Text(
-                                    "Delete ${item.name} from your library?",
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                        "Move ${item.name} to the Recycle Bin? You can restore it later."
+                                    } else {
+                                        "Android 10 and older do not support the native Recycle Bin. ${item.name} will be permanently deleted."
+                                    },
                                     color = Muted
                                 )
                             },
@@ -270,7 +278,14 @@ class MainActivity : ComponentActivity() {
                                     deleteRecording(item, true)
                                     deleteTarget = null
                                 }) {
-                                    Text("Delete", color = Red)
+                                    Text(
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                            "Move to Bin"
+                                        } else {
+                                            "Delete"
+                                        },
+                                        color = Red
+                                    )
                                 }
                             },
                             dismissButton = {
@@ -491,15 +506,35 @@ class MainActivity : ComponentActivity() {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     ActionCard(
                         modifier = Modifier.weight(1f),
+                        icon = "●",
+                        title = "Quick Record",
+                        subtitle = "Start screen capture",
+                        tint = Red,
+                        background = SoftRed,
+                        onClick = {
+                            if (!isRecording) requestCapture()
+                            else statusMessage = "A recording is already running."
+                        }
+                    )
+
+                    ActionCard(
+                        modifier = Modifier.weight(1f),
                         icon = "▣",
                         title = "Screenshots",
                         subtitle = "Capture your screen",
                         tint = Purple,
                         background = Color(0xFFF0EAFF),
                         onClick = {
-                            startActivity(Intent(this@MainActivity, ScreenshotActivity::class.java))
+                            startActivity(
+                                Intent(this@MainActivity, ScreenshotActivity::class.java)
+                            )
                         }
                     )
+                }
+            }
+
+            item {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     ActionCard(
                         modifier = Modifier.weight(1f),
                         icon = "▶",
@@ -510,6 +545,20 @@ class MainActivity : ComponentActivity() {
                         onClick = {
                             showGallery = true
                             loadRecordings()
+                        }
+                    )
+
+                    ActionCard(
+                        modifier = Modifier.weight(1f),
+                        icon = "♻",
+                        title = "Recycle Bin",
+                        subtitle = "Restore or remove media",
+                        tint = Teal,
+                        background = SoftGreen,
+                        onClick = {
+                            startActivity(
+                                Intent(this@MainActivity, RecycleBinActivity::class.java)
+                            )
                         }
                     )
                 }
@@ -1118,12 +1167,15 @@ class MainActivity : ComponentActivity() {
         requestUserConsent: Boolean
     ) {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && requestUserConsent) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                requestUserConsent
+            ) {
                 pendingDelete = item
 
-                val request = MediaStore.createDeleteRequest(
+                val request = MediaStore.createTrashRequest(
                     contentResolver,
-                    listOf(item.uri)
+                    listOf(item.uri),
+                    true
                 )
 
                 mediaChangeLauncher.launch(
@@ -1133,11 +1185,20 @@ class MainActivity : ComponentActivity() {
             }
 
             val deleted = contentResolver.delete(item.uri, null, null)
-            statusMessage = if (deleted > 0) "Recording deleted."
-            else "Recording was not deleted."
+
+            statusMessage = if (deleted > 0) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    "Recording moved to Recycle Bin."
+                } else {
+                    "Recording permanently deleted. Recycle Bin requires Android 11+."
+                }
+            } else {
+                "Recording was not deleted."
+            }
 
             loadRecordings()
         } catch (e: Exception) {
+            pendingDelete = null
             statusMessage = "Delete failed: ${e.message ?: "Unknown error"}"
         }
     }
