@@ -26,6 +26,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -121,12 +122,16 @@ class RecycleBinActivity : ComponentActivity() {
 
                     while (cursor.moveToNext()) {
                         val id = cursor.getLong(idColumn)
-                        val name = cursor.getString(nameColumn) ?: "Unnamed file"
+                        val name =
+                            cursor.getString(nameColumn) ?: "Unnamed file"
                         val path = cursor.getString(pathColumn).orEmpty()
 
                         result.add(
                             RecycleBinItem(
-                                uri = ContentUris.withAppendedId(collectionUri, id),
+                                uri = ContentUris.withAppendedId(
+                                    collectionUri,
+                                    id
+                                ),
                                 name = name,
                                 type = if (path.startsWith("Movies/")) {
                                     "Video"
@@ -151,7 +156,9 @@ class RecycleBinActivity : ComponentActivity() {
         item: RecycleBinItem,
         restore: Boolean
     ): IntentSenderRequest? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return null
+        }
 
         return try {
             val request = if (restore) {
@@ -174,6 +181,7 @@ class RecycleBinActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun RecycleBinScreen(
     loadItems: () -> List<RecycleBinItem>,
@@ -181,9 +189,13 @@ private fun RecycleBinScreen(
     createDeleteRequest: (RecycleBinItem) -> IntentSenderRequest?,
     onBack: () -> Unit
 ) {
-    var binItems by remember { mutableStateOf(emptyList<RecycleBinItem>()) }
+    var binItems by remember {
+        mutableStateOf(emptyList<RecycleBinItem>())
+    }
     var loading by remember { mutableStateOf(true) }
-    var selectedForDelete by remember { mutableStateOf<RecycleBinItem?>(null) }
+    var selectedForDelete by remember {
+        mutableStateOf<RecycleBinItem?>(null)
+    }
     var status by remember { mutableStateOf("") }
     var refreshKey by remember { mutableStateOf(0) }
 
@@ -250,7 +262,8 @@ private fun RecycleBinScreen(
                 Build.VERSION.SDK_INT < Build.VERSION_CODES.R -> {
                     Text(
                         "Native Recycle Bin requires Android 11 or newer. " +
-                        "On older Android versions, deleted files may be permanently removed."
+                        "On older Android versions, deleted files may be " +
+                        "permanently removed."
                     )
                 }
 
@@ -298,7 +311,8 @@ private fun RecycleBinScreen(
 
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        horizontalArrangement =
+                                            Arrangement.spacedBy(8.dp)
                                     ) {
                                         Button(
                                             onClick = {
@@ -306,9 +320,12 @@ private fun RecycleBinScreen(
                                                     createRestoreRequest(item)
 
                                                 if (request != null) {
-                                                    mediaActionLauncher.launch(request)
+                                                    mediaActionLauncher.launch(
+                                                        request
+                                                    )
                                                 } else {
-                                                    status = "Could not prepare restore request."
+                                                    status =
+                                                        "Could not prepare restore request."
                                                 }
                                             },
                                             modifier = Modifier.weight(1f)
@@ -336,11 +353,16 @@ private fun RecycleBinScreen(
 
     selectedForDelete?.let { item ->
         AlertDialog(
-            onDismissRequest = { selectedForDelete = null },
-            title = { Text("Delete permanently?") },
+            onDismissRequest = {
+                selectedForDelete = null
+            },
+            title = {
+                Text("Delete permanently?")
+            },
             text = {
                 Text(
-                    "\"${item.name}\" will be permanently deleted and may not be recoverable."
+                    "\"${item.name}\" will be permanently deleted " +
+                    "and may not be recoverable."
                 )
             },
             confirmButton = {
@@ -349,10 +371,12 @@ private fun RecycleBinScreen(
                         selectedForDelete = null
 
                         val request = createDeleteRequest(item)
+
                         if (request != null) {
                             mediaActionLauncher.launch(request)
                         } else {
-                            status = "Could not prepare permanent-delete request."
+                            status =
+                                "Could not prepare permanent-delete request."
                         }
                     }
                 ) {
@@ -360,7 +384,11 @@ private fun RecycleBinScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { selectedForDelete = null }) {
+                TextButton(
+                    onClick = {
+                        selectedForDelete = null
+                    }
+                ) {
                     Text("Cancel")
                 }
             }
