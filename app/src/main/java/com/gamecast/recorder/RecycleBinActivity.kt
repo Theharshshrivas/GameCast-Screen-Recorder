@@ -2,7 +2,6 @@ package com.gamecast.recorder
 
 import android.app.Activity
 import android.content.ContentUris
-import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -40,6 +39,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 
 class RecycleBinActivity : ComponentActivity() {
@@ -51,12 +51,6 @@ class RecycleBinActivity : ComponentActivity() {
             MaterialTheme {
                 RecycleBinScreen(
                     loadItems = { loadTrashedItems() },
-                    requestRestore = { item ->
-                        restoreItem(item)
-                    },
-                    requestPermanentDelete = { item ->
-                        permanentlyDeleteItem(item)
-                    },
                     onBack = { finish() }
                 )
             }
@@ -71,11 +65,11 @@ class RecycleBinActivity : ComponentActivity() {
         val result = mutableListOf<RecycleBinItem>()
 
         val collections = listOf(
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI to "Video",
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI to "Screenshot"
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         )
 
-        for ((collectionUri, type) in collections) {
+        for (collectionUri in collections) {
             val projection = arrayOf(
                 MediaStore.MediaColumns._ID,
                 MediaStore.MediaColumns.DISPLAY_NAME,
@@ -84,8 +78,8 @@ class RecycleBinActivity : ComponentActivity() {
 
             val selection =
                 "${MediaStore.MediaColumns.IS_TRASHED} = ? AND " +
-                "(${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? OR " +
-                "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?)"
+                    "(${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? OR " +
+                    "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?)"
 
             val selectionArgs = arrayOf(
                 "1",
@@ -101,12 +95,15 @@ class RecycleBinActivity : ComponentActivity() {
                     selectionArgs,
                     "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
                 )?.use { cursor ->
-                    val idColumn =
-                        cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
-                    val nameColumn =
-                        cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
-                    val pathColumn =
-                        cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
+                    val idColumn = cursor.getColumnIndexOrThrow(
+                        MediaStore.MediaColumns._ID
+                    )
+                    val nameColumn = cursor.getColumnIndexOrThrow(
+                        MediaStore.MediaColumns.DISPLAY_NAME
+                    )
+                    val pathColumn = cursor.getColumnIndexOrThrow(
+                        MediaStore.MediaColumns.RELATIVE_PATH
+                    )
 
                     while (cursor.moveToNext()) {
                         val id = cursor.getLong(idColumn)
@@ -114,74 +111,27 @@ class RecycleBinActivity : ComponentActivity() {
                         val path = cursor.getString(pathColumn).orEmpty()
                         val uri = ContentUris.withAppendedId(collectionUri, id)
 
-                        val actualType =
-                            if (path.startsWith("Movies/")) "Video" else "Screenshot"
-
                         result.add(
                             RecycleBinItem(
                                 uri = uri,
                                 name = name,
-                                type = if (type == "Video") actualType else "Screenshot",
+                                type = if (collectionUri == MediaStore.Video.Media.EXTERNAL_CONTENT_URI) {
+                                    "Video"
+                                } else {
+                                    "Screenshot/Image"
+                                },
                                 path = path
                             )
                         )
                     }
                 }
             } catch (_: Exception) {
-                // Keep the screen usable if the system cannot query a media collection.
+                // Continue loading the other media collection if one query fails.
             }
         }
 
-        return result.distinctBy { it.uri }.sortedBy { it.name.lowercase() }
-    }
-
-    private fun restoreItem(item: RecycleBinItem) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-
-        try {
-            val request = MediaStore.createTrashRequest(
-                contentResolver,
-                listOf(item.uri),
-                false
-            )
-            @Suppress("DEPRECATION")
-            startIntentSenderForResult(
-                request.intentSender,
-                REQUEST_MEDIA_ACTION,
-                null,
-                0,
-                0,
-                0
-            )
-        } catch (_: Exception) {
-            // The activity refreshes when it resumes.
-        }
-    }
-
-    private fun permanentlyDeleteItem(item: RecycleBinItem) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-
-        try {
-            val request = MediaStore.createDeleteRequest(
-                contentResolver,
-                listOf(item.uri)
-            )
-            @Suppress("DEPRECATION")
-            startIntentSenderForResult(
-                request.intentSender,
-                REQUEST_MEDIA_ACTION,
-                null,
-                0,
-                0,
-                0
-            )
-        } catch (_: Exception) {
-            // The activity refreshes when it resumes.
-        }
-    }
-
-    companion object {
-        private const val REQUEST_MEDIA_ACTION = 401
+        return result.distinctBy { it.uri }
+            .sortedByDescending { it.name.lowercase() }
     }
 }
 
@@ -195,27 +145,82 @@ private data class RecycleBinItem(
 @Composable
 private fun RecycleBinScreen(
     loadItems: () -> List<RecycleBinItem>,
-    requestRestore: (RecycleBinItem) -> Unit,
-    requestPermanentDelete: (RecycleBinItem) -> Unit,
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
+    val contentResolver = context.contentResolver
+
     var items by remember { mutableStateOf(emptyList<RecycleBinItem>()) }
     var loading by remember { mutableStateOf(true) }
     var selectedForDelete by remember { mutableStateOf<RecycleBinItem?>(null) }
+    var status by remember { mutableStateOf("") }
     var refreshKey by remember { mutableStateOf(0) }
+    var pendingAction by remember { mutableStateOf("none") }
 
     val mediaActionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            refreshKey++
+            status = when (pendingAction) {
+                "restore" -> "File restored."
+                "delete" -> "File permanently deleted."
+                else -> "Action completed."
+            }
+        } else {
+            status = "Action cancelled. No change confirmed."
         }
+
+        pendingAction = "none"
+        refreshKey++
     }
 
     LaunchedEffect(refreshKey) {
         loading = true
         items = loadItems()
         loading = false
+    }
+
+    fun launchRestore(item: RecycleBinItem) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            status = "Native Recycle Bin requires Android 11 or newer."
+            return
+        }
+
+        try {
+            val request = MediaStore.createTrashRequest(
+                contentResolver,
+                listOf(item.uri),
+                false
+            )
+            pendingAction = "restore"
+            mediaActionLauncher.launch(
+                IntentSenderRequest.Builder(request.intentSender).build()
+            )
+        } catch (e: Exception) {
+            pendingAction = "none"
+            status = "Could not restore file: ${e.message ?: "Unknown error"}"
+        }
+    }
+
+    fun launchPermanentDelete(item: RecycleBinItem) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            status = "Native Recycle Bin requires Android 11 or newer."
+            return
+        }
+
+        try {
+            val request = MediaStore.createDeleteRequest(
+                contentResolver,
+                listOf(item.uri)
+            )
+            pendingAction = "delete"
+            mediaActionLauncher.launch(
+                IntentSenderRequest.Builder(request.intentSender).build()
+            )
+        } catch (e: Exception) {
+            pendingAction = "none"
+            status = "Could not delete file: ${e.message ?: "Unknown error"}"
+        }
     }
 
     Scaffold(
@@ -249,15 +254,20 @@ private fun RecycleBinScreen(
             Spacer(Modifier.height(6.dp))
 
             Text(
-                text = "Restore files to remove them from the Recycle Bin, or permanently delete them.",
+                text = "Restore files or permanently delete them from the system Recycle Bin.",
                 style = MaterialTheme.typography.bodyMedium
             )
+
+            if (status.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text(status, style = MaterialTheme.typography.bodySmall)
+            }
 
             Spacer(Modifier.height(16.dp))
 
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
                 Text(
-                    text = "Native Recycle Bin requires Android 11 or newer. On this Android version, deleted files may be permanently removed.",
+                    text = "Native Recycle Bin requires Android 11 or newer. Files deleted on older Android versions may be permanently removed.",
                     style = MaterialTheme.typography.bodyLarge
                 )
             } else if (loading) {
@@ -287,9 +297,7 @@ private fun RecycleBinScreen(
                 ) {
                     items(items, key = { it.uri.toString() }) { item ->
                         Card(modifier = Modifier.fillMaxWidth()) {
-                            Column(
-                                modifier = Modifier.padding(12.dp)
-                            ) {
+                            Column(Modifier.padding(12.dp)) {
                                 Text(
                                     text = item.name,
                                     style = MaterialTheme.typography.titleSmall
@@ -309,7 +317,7 @@ private fun RecycleBinScreen(
                                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
                                     Button(
-                                        onClick = { requestRestore(item) },
+                                        onClick = { launchRestore(item) },
                                         modifier = Modifier.weight(1f)
                                     ) {
                                         Text("Restore")
@@ -343,7 +351,7 @@ private fun RecycleBinScreen(
                 TextButton(
                     onClick = {
                         selectedForDelete = null
-                        requestPermanentDelete(item)
+                        launchPermanentDelete(item)
                     }
                 ) {
                     Text("Delete Forever")
