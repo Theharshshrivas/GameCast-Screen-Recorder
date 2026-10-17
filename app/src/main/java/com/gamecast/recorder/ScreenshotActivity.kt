@@ -1,9 +1,11 @@
+
 package com.gamecast.recorder
 
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
+import android.content.IntentFilter
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -23,6 +25,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
@@ -52,6 +55,7 @@ class ScreenshotActivity : ComponentActivity() {
     private var status by mutableStateOf("Ready to capture a screenshot")
     private var screenshots by mutableStateOf<List<ScreenshotItem>>(emptyList())
     private var busy by mutableStateOf(false)
+    private var pendingDelete by mutableStateOf<ScreenshotItem?>(null)
 
     private val captureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -60,14 +64,14 @@ class ScreenshotActivity : ComponentActivity() {
             busy = true
             status = "Capturing screenshot..."
 
-            val intent = Intent(this, ScreenshotService::class.java).apply {
+            val serviceIntent = Intent(this, ScreenshotService::class.java).apply {
                 action = ScreenshotService.ACTION_CAPTURE
                 putExtra(ScreenshotService.EXTRA_RESULT_CODE, result.resultCode)
                 putExtra(ScreenshotService.EXTRA_PROJECTION_DATA, result.data)
             }
 
             try {
-                ContextCompat.startForegroundService(this, intent)
+                ContextCompat.startForegroundService(this, serviceIntent)
             } catch (e: Exception) {
                 busy = false
                 status = "Could not start capture: ${e.message ?: "Unknown error"}"
@@ -77,25 +81,26 @@ class ScreenshotActivity : ComponentActivity() {
         }
     }
 
-    private val resultReceiver = object : android.content.BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != ScreenshotService.ACTION_RESULT) return
-            busy = false
-            status = intent.getStringExtra(ScreenshotService.EXTRA_MESSAGE)
-                ?: "Capture finished"
-            loadScreenshots()
-        }
-    }
-
-    private val deleteLauncher = registerForActivityResult(
+    private val mediaActionLauncher = registerForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
         status = if (result.resultCode == Activity.RESULT_OK) {
             "Screenshot moved to Recycle Bin."
         } else {
-            "Delete cancelled."
+            "Move to Bin cancelled."
         }
         loadScreenshots()
+    }
+
+    private val resultReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != ScreenshotService.ACTION_RESULT) return
+
+            busy = false
+            status = intent.getStringExtra(ScreenshotService.EXTRA_MESSAGE)
+                ?: "Capture finished"
+            loadScreenshots()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -104,7 +109,7 @@ class ScreenshotActivity : ComponentActivity() {
         ContextCompat.registerReceiver(
             this,
             resultReceiver,
-            android.content.IntentFilter(ScreenshotService.ACTION_RESULT),
+            IntentFilter(ScreenshotService.ACTION_RESULT),
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
 
@@ -183,6 +188,7 @@ class ScreenshotActivity : ComponentActivity() {
                                     Card(Modifier.fillMaxWidth()) {
                                         Column(Modifier.padding(12.dp)) {
                                             Text(item.name)
+
                                             Text(
                                                 "${formatSize(item.size)} • ${
                                                     DateFormat.getDateTimeInstance(
@@ -197,17 +203,13 @@ class ScreenshotActivity : ComponentActivity() {
                                                     Arrangement.spacedBy(8.dp)
                                             ) {
                                                 TextButton(
-                                                    onClick = {
-                                                        shareScreenshot(item)
-                                                    }
+                                                    onClick = { shareScreenshot(item) }
                                                 ) {
                                                     Text("Share")
                                                 }
 
                                                 TextButton(
-                                                    onClick = {
-                                                        deleteScreenshot(item)
-                                                    }
+                                                    onClick = { pendingDelete = item }
                                                 ) {
                                                     Text("Move to Bin")
                                                 }
@@ -218,6 +220,39 @@ class ScreenshotActivity : ComponentActivity() {
                             }
                         }
                     }
+                }
+
+                pendingDelete?.let { item ->
+                    AlertDialog(
+                        onDismissRequest = { pendingDelete = null },
+                        title = { Text("Move screenshot to Recycle Bin?") },
+                        text = {
+                            Text(
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                    "\"${item.name}\" will be moved to the system Recycle Bin. You can restore it later."
+                                } else {
+                                    "Android ${Build.VERSION.SDK_INT} does not support the native MediaStore Recycle Bin. This screenshot may be permanently deleted."
+                                }
+                            )
+                        },
+                        confirmButton = {
+                            TextButton(
+                                onClick = {
+                                    pendingDelete = null
+                                    moveScreenshotToBin(item)
+                                }
+                            ) {
+                                Text("Continue")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(
+                                onClick = { pendingDelete = null }
+                            ) {
+                                Text("Cancel")
+                            }
+                        }
+                    )
                 }
             }
         }
@@ -233,7 +268,7 @@ class ScreenshotActivity : ComponentActivity() {
         val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         val result = mutableListOf<ScreenshotItem>()
 
-        val columns = arrayOf(
+        val projection = arrayOf(
             MediaStore.Images.Media._ID,
             MediaStore.Images.Media.DISPLAY_NAME,
             MediaStore.Images.Media.SIZE,
@@ -241,49 +276,53 @@ class ScreenshotActivity : ComponentActivity() {
             MediaStore.Images.Media.RELATIVE_PATH
         )
 
+        val selection: String
+        val selectionArgs: Array<String>
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            selection =
+                "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ? AND " +
+                "${MediaStore.MediaColumns.IS_TRASHED} = ?"
+            selectionArgs = arrayOf("%Pictures/GameCast%", "0")
+        } else {
+            selection = "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
+            selectionArgs = arrayOf("%Pictures/GameCast%")
+        }
+
         try {
             contentResolver.query(
                 collection,
-                columns,
-                null,
-                null,
+                projection,
+                selection,
+                selectionArgs,
                 "${MediaStore.Images.Media.DATE_ADDED} DESC"
             )?.use { cursor ->
-                val idCol = cursor.getColumnIndexOrThrow(
+                val idColumn = cursor.getColumnIndexOrThrow(
                     MediaStore.Images.Media._ID
                 )
-                val nameCol = cursor.getColumnIndexOrThrow(
+                val nameColumn = cursor.getColumnIndexOrThrow(
                     MediaStore.Images.Media.DISPLAY_NAME
                 )
-                val sizeCol = cursor.getColumnIndexOrThrow(
+                val sizeColumn = cursor.getColumnIndexOrThrow(
                     MediaStore.Images.Media.SIZE
                 )
-                val dateCol = cursor.getColumnIndexOrThrow(
+                val dateColumn = cursor.getColumnIndexOrThrow(
                     MediaStore.Images.Media.DATE_ADDED
-                )
-                val pathCol = cursor.getColumnIndexOrThrow(
-                    MediaStore.Images.Media.RELATIVE_PATH
                 )
 
                 while (cursor.moveToNext()) {
-                    val path = cursor.getString(pathCol).orEmpty()
-
-                    if (path.contains("Pictures/GameCast", ignoreCase = true)) {
-                        val id = cursor.getLong(idCol)
-
-                        result.add(
-                            ScreenshotItem(
-                                uri = Uri.withAppendedPath(
-                                    collection,
-                                    id.toString()
-                                ),
-                                name = cursor.getString(nameCol)
-                                    ?: "Screenshot.png",
-                                size = cursor.getLong(sizeCol),
-                                dateAdded = cursor.getLong(dateCol)
-                            )
+                    result.add(
+                        ScreenshotItem(
+                            uri = Uri.withAppendedPath(
+                                collection,
+                                cursor.getLong(idColumn).toString()
+                            ),
+                            name = cursor.getString(nameColumn)
+                                ?: "Screenshot.png",
+                            size = cursor.getLong(sizeColumn),
+                            dateAdded = cursor.getLong(dateColumn)
                         )
-                    }
+                    )
                 }
             }
 
@@ -309,7 +348,7 @@ class ScreenshotActivity : ComponentActivity() {
         }
     }
 
-    private fun deleteScreenshot(item: ScreenshotItem) {
+    private fun moveScreenshotToBin(item: ScreenshotItem) {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 val request = MediaStore.createTrashRequest(
@@ -318,10 +357,8 @@ class ScreenshotActivity : ComponentActivity() {
                     true
                 )
 
-                deleteLauncher.launch(
-                    IntentSenderRequest.Builder(
-                        request.intentSender
-                    ).build()
+                mediaActionLauncher.launch(
+                    IntentSenderRequest.Builder(request.intentSender).build()
                 )
             } else {
                 val deleted = contentResolver.delete(item.uri, null, null)
